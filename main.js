@@ -67,7 +67,7 @@ async function generateImageFromPrompt(message, enhancedPrompt) {
     const response = await axios.post(
       'https://openrouter.ai/api/v1/generate',
       {
-        model: 'stabilityai/stable-diffusion-xl-base-1.0',
+        model: 'stabilityai/stable-diffusion-xl-base',
         prompt: enhancedPrompt,
         num_images: 1,
         size: '1024x1024',
@@ -75,24 +75,40 @@ async function generateImageFromPrompt(message, enhancedPrompt) {
       {
         headers: {
           Authorization: `Bearer ${process.env.OPENROUTER_API_KEY}`,
-          'HTTP-Accept': 'application/json',
+          'Accept': 'application/json',
           'Content-Type': 'application/json',
         },
+        timeout: 10000, // 10 seconds timeout
+        retry: { times: 3 } // 3 retry attempts
       }
     );
-
+ 
+    if (response.status !== 200) {
+      console.error('API returned non-200 status:', response.status, response.data);
+      message.reply(`❌ API error: ${response.status}`);
+      return;
+    }
+ 
+    if (response.data?.error) {
+      console.error('API returned error in data:', response.data.error);
+      message.reply(`❌ API error: ${response.data.error}`);
+      return;
+    }
+ 
     if (!response?.data?.data) {
-      message.reply('❌ Invalid response from image generation API.');
+      console.error('Invalid API response structure. Full data:', response.data);
+      message.reply('❌ Invalid response from image generation API. Please check logs.');
       return;
     }
     if (!Array.isArray(response.data.data) || response.data.data.length === 0) {
+      console.error('Unexpected data format. Expected array but got:', response.data.data);
       message.reply('❌ No images generated.');
       return;
     }
     const imageUrl = response.data.data[0].image_url;
     message.reply(`🖼️ Generated Image: ${imageUrl}`);
   } catch (err) {
-    console.error('Error generating image:', err);
+    console.error('Error generating image:', err.response ? err.response.data : err.message);
     message.reply('❌ Failed to generate image. Please try again later.');
   }
 }
@@ -186,13 +202,16 @@ bot.on('messageCreate', async (message) => {
       }
 
       for (const file of results) {
-        if (fs.existsSync(file.file_path)) {
-          message.reply({
+        const fileExists = await fs.promises.access(file.file_path, fs.constants.F_OK)
+          .then(() => true)
+          .catch(() => false);
+        if (fileExists) {
+          await message.reply({
             files: [file.file_path],
             content: `📄 Found: \`${file.filename}\` (Uploaded by <@${file.user_id}>)`,
           });
         } else {
-          message.reply(`❌ File \`${file.filename}\` not found on disk.`);
+          await message.reply(`❌ File \`${file.filename}\` not found on disk.`);
         }
       }
     } catch (err) {

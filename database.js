@@ -22,13 +22,24 @@ db.serialize(() => {
 
 // Save file metadata to database
 function saveFile(userId, filename, filePath, messageLink = null) {
-  const stmt = db.prepare(
-    `INSERT INTO files (user_id, filename, file_path, message_link) 
-     VALUES (?, ?, ?, ?)`
-  );
-  stmt.run(userId, filename, filePath, messageLink, () => {
-    stmt.finalize();
-    console.log(`Saved file: ${filename}`);
+  return new Promise((resolve, reject) => {
+    try {
+      const stmt = db.prepare(
+        `INSERT INTO files (user_id, filename, file_path, message_link)
+         VALUES (?, ?, ?, ?)`
+      );
+      stmt.run(userId, filename, filePath, messageLink, (err) => {
+        if (err) {
+          reject(err);
+        } else {
+          stmt.finalize();
+          console.log(`Saved file: ${filename}`);
+          resolve(`Saved file: ${filename}`);
+        }
+      });
+    } catch (err) {
+      reject(err);
+    }
   });
 }
 
