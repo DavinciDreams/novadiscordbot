@@ -11,6 +11,17 @@ function ensureStorageDir() {
   }
 }
 
+// Validate HTTP/HTTPS URL
+function isValidHttpUrl(string) {
+  if (typeof string !== 'string') return false;
+  try {
+    new URL(string);
+    return true;
+  } catch (err) {
+    return false;
+  }
+}
+
 // Save file to disk
 async function saveFileToDisk(attachment, filename) {
   ensureStorageDir();
@@ -21,4 +32,4 @@ async function saveFileToDisk(attachment, filename) {
   return filePath;
 }
 
-module.exports = { saveFileToDisk };
+module.exports = { saveFileToDisk, isValidHttpUrl };

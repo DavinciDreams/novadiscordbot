@@ -2,9 +2,17 @@
 require('dotenv').config({ path: 'config.env' });
 const { Client, IntentsBitField } = require('discord.js');
 const { saveFile, searchFiles } = require('./database');
-const { saveFileToDisk } = require('./utils');
+const { saveFileToDisk, isValidHttpUrl } = require('./utils');
 const axios = require('axios');
 const fs = require('fs');
+
+// Rate limit configuration
+const RATE_LIMIT = {
+  MAX_REQUESTS: 5,
+  TIME_WINDOW_MS: 60000, // 1 minute
+  requestCount: 0,
+  lastRequestTime: null
+};
 
 // Prompt enhancement and NLP functions
 function enhancePrompt(prompt) {
@@ -64,54 +72,308 @@ function enhancePrompt(prompt) {
 // Image generation function
 async function generateImageFromPrompt(message, enhancedPrompt) {
   try {
-    const response = await axios.post(
-      'https://openrouter.ai/api/v1/generate',
-      {
-        model: 'stabilityai/stable-diffusion-xl-base',
-        prompt: enhancedPrompt,
-        num_images: 1,
-        size: '1024x1024',
-      },
-      {
-        headers: {
-          Authorization: `Bearer ${process.env.OPENROUTER_API_KEY}`,
-          'Accept': 'application/json',
-          'Content-Type': 'application/json',
-        },
-        timeout: 10000, // 10 seconds timeout
-        retry: { times: 3 } // 3 retry attempts
+    // Models to try in order: primary then fallbacks
+    const models = [
+      'stabilityai/stable-diffusion-xl-light',
+      'stabilityai/stable-diffusion-xl',
+      'runwayml/stable-diffusion-v2'
+    ];
+
+    for (const model of models) {
+      // Rate limit check for each model attempt
+      const now = Date.now();
+      if (RATE_LIMIT.lastRequestTime !== null) {
+        const timeSinceLastRequest = now - RATE_LIMIT.lastRequestTime;
+        if (timeSinceLastRequest < RATE_LIMIT.TIME_WINDOW_MS) {
+          if (RATE_LIMIT.requestCount >= RATE_LIMIT.MAX_REQUESTS) {
+            message.reply('❌ Rate limit exceeded. Please wait a moment before trying again.');
+            return;
+          } else {
+            RATE_LIMIT.requestCount++;
+          }
+        } else {
+          RATE_LIMIT.requestCount = 1;
+          RATE_LIMIT.lastRequestTime = now;
+        }
+      } else {
+        RATE_LIMIT.requestCount = 1;
+        RATE_LIMIT.lastRequestTime = now;
       }
-    );
- 
-    if (response.status !== 200) {
-      console.error('API returned non-200 status:', response.status, response.data);
-      message.reply(`❌ API error: ${response.status}`);
-      return;
+
+      // Exponential backoff settings for each model
+      const maxRetries = 3;
+      let retryDelay = 1000; // Start with 1 second
+      let retryCount = 0;
+      let response;
+
+      while (retryCount < maxRetries) {
+        try {
+          response = await axios.post(
+            'https://openrouter.ai/api/v1/generate',
+            {
+              model: model,
+              prompt: enhancedPrompt,
+              num_images: 1,
+              size: '1024x1024',
+            },
+            {
+              headers: {
+                Authorization: `Bearer ${process.env.OPENROUTER_API_KEY}`,
+                'Accept': 'application/json',
+                'Content-Type': 'application/json',
+              },
+              timeout: 10000, // 10 seconds timeout
+            }
+          );
+          break; // Success, exit retry loop
+        } catch (err) {
+          if (err.response && [429, 500, 502, 503, 504].includes(err.response.status)) {
+            retryCount++;
+            if (retryCount >= maxRetries) {
+              break; // Move to next model after retries exhausted
+            }
+            console.debug(`[API] Retrying model ${model} due to ${err.response.status} error...`);
+            await new Promise(resolve => setTimeout(resolve, retryDelay));
+            retryDelay *= 2; // Exponential backoff
+          } else {
+            break; // Non-retryable error, try next model
+          }
+        }
+      }
+      
+      // If we got a successful response for this model, process it
+      if (response?.status === 200) {
+        // Debug logging
+        console.log('API Response:', JSON.stringify(response.data, null, 2));
+        
+        // Enhanced response handling with defensive checks
+        if (response?.data && typeof response.data === 'object' && response.data !== null) {
+          let imageUrl = null;
+          
+          // Type validation for critical response properties
+          if (!Array.isArray(response.data.data)) {
+            console.error('Invalid data structure: data.data is not an array. Full data:', JSON.stringify(response.data, null, 2));
+            message.reply('❌ [INVALID_RESPONSE] Unexpected API response structure. Please try again.');
+            return;
+          }
+  
+          // Log full structure for debugging
+          console.log('Debugging - Full API response structure:', JSON.stringify(response.data, null, 2));
+  
+          // Primary path: data.data[0].image_url
+          if (response.data.data?.[0]?.image_url) {
+            imageUrl = response.data.data[0].image_url;
+          }
+  
+          // If primary not found, try fallback paths
+          if (!imageUrl) {
+            const FALLBACK_PATHS = [
+              ['url'],
+              ['image_url'],
+              ['images', 0, 'url'],
+              ['link'],
+              ['images', 'url'],
+              ['data', 'url'],
+              ['response', 'url'],
+              ['result', 'url'],
+              ['image', 'url']
+            ];
+  
+            const isValidHttpUrl = (string) => {
+              if (typeof string !== 'string') return false;
+              try {
+                new URL(string);
+                return true;
+              } catch (err) {
+                return false;
+              }
+            };
+  
+            const getNestedProperty = (obj, path) => path.reduce((acc, key) => acc?.[key], obj);
+  
+            for (const path of FALLBACK_PATHS) {
+              const value = getNestedProperty(response.data, path);
+              if (value && isValidHttpUrl(value)) {
+                imageUrl = value;
+                console.debug(`Fallback path ${path.join('.')} successful. Image URL: ${imageUrl}`);
+                break;
+              } else {
+                console.debug(`Fallback path ${path.join('.')} attempted. Value: ${value}`);
+              }
+            }
+          }
+  
+          // Validate and send image URL if found
+          if (imageUrl) {
+            if (isValidHttpUrl(imageUrl)) {
+              message.reply(`🖼️ Generated Image: ${imageUrl}`);
+            } else {
+              console.error('Invalid image URL format in API response after fallback:', imageUrl);
+              message.reply('❌ [URL_INVALID] Invalid image URL format in API response.');
+            }
+          } else {
+            console.error('No valid image URL found in API response after trying all fallback paths. Full data:', JSON.stringify(response.data, null, 2));
+            message.reply(`❌ [NO_IMAGE_URL] Could not find image URL in API response. Raw response: ${JSON.stringify(response.data)}`);
+          }
+        } else if (response?.data?.error || response?.data?.message) {
+          const errorDetail = response.data.error || response.data.message;
+          console.error('API returned error:', errorDetail);
+          message.reply(`❌ [API_ERROR] ${errorDetail}. Raw response: ${JSON.stringify(response.data)}`);
+        } else {
+          console.error('Unexpected API response structure. Full data:', response.data);
+          message.reply('❌ [UNEXPECTED_RESPONSE] Invalid response from image generation API. Raw response: ' + (response?.data ? JSON.stringify(response.data) : 'No data'));
+        }
+        return; // Successfully processed this model
+      }
     }
- 
-    if (response.data?.error) {
-      console.error('API returned error in data:', response.data.error);
-      message.reply(`❌ API error: ${response.data.error}`);
-      return;
-    }
- 
-    if (!response?.data?.data) {
-      console.error('Invalid API response structure. Full data:', response.data);
-      message.reply('❌ Invalid response from image generation API. Please check logs.');
-      return;
-    }
-    if (!Array.isArray(response.data.data) || response.data.data.length === 0) {
-      console.error('Unexpected data format. Expected array but got:', response.data.data);
-      message.reply('❌ No images generated.');
-      return;
-    }
-    const imageUrl = response.data.data[0].image_url;
-    message.reply(`🖼️ Generated Image: ${imageUrl}`);
+    
+    // If all models failed
+    throw new Error('All available models failed to generate an image');
   } catch (err) {
-    console.error('Error generating image:', err.response ? err.response.data : err.message);
-    message.reply('❌ Failed to generate image. Please try again later.');
+    // Enhanced error logging with context
+    const errorContext = {
+      timestamp: new Date().toISOString(),
+      userId: message.author.id,
+      prompt: enhancedPrompt,
+      errorMessage: err.message,
+      errorType: err.name,
+      responseData: err.response?.data,
+      statusCode: err.response?.status,
+      stack: err.stack
+    };
+    console.error('[API] Detailed error:', errorContext);
+
+    if (err.response) {
+      // Structured error handling for different status codes
+      let errorMessage = `❌ [API_ERROR] Request failed with status ${err.response.status}`;
+      
+      switch (err.response.status) {
+        case 429:
+          errorMessage += ' - Rate limit exceeded. Please wait 1 minute before trying again.';
+          break;
+        case 401:
+          errorMessage += ' - Unauthorized. Check your API key configuration.';
+          break;
+        case 403:
+          errorMessage += ' - Forbidden. Check API permissions or quota.';
+          break;
+        case 404:
+          errorMessage += ' - Endpoint not found. Check API URL configuration.';
+          break;
+        case 500:
+        case 502:
+        case 503:
+        case 504:
+          errorMessage += ' - Server error. This may be a temporary issue.';
+          break;
+        default:
+          const errorDetail = err.response.data?.error || err.response.data?.message || 'Unknown error';
+          errorMessage += `: ${errorDetail}`;
+      }
+      
+      // Include raw response in debug logs
+      console.debug('[API] Full error response:', err.response.data);
+      
+      message.reply(`${errorMessage}\n\nSuggested actions:\n- Try a simpler prompt like "a cute cat"\n- Verify API key configuration\n- Check service status if error persists`);
+    } else if (err.code === 'ECONNABORTED') {
+      console.error('[API] Connection timeout:', errorContext);
+      message.reply('❌ [TIMEOUT] Request timed out. Check internet connection and try again.');
+    } else if (err.request) {
+      // Network errors
+      console.error('[API] Network error:', errorContext);
+      message.reply('❌ [NETWORK] Network error. Check internet connection and try again.');
+    } else {
+      // Other errors
+      console.error('[API] Unexpected error:', errorContext);
+      message.reply(`❌ [UNHANDLED] Error processing request: ${err.message}. Try again later.`);
+    }
   }
 }
+    
+    // If we got a successful response for this model, process it
+    if (response?.status === 200) {
+      // Debug logging
+      console.log('API Response:', JSON.stringify(response.data, null, 2));
+      
+      // Enhanced response handling with defensive checks
+      if (response?.data && typeof response.data === 'object' && response.data !== null) {
+        let imageUrl = null;
+        
+        // Type validation for critical response properties
+        if (!Array.isArray(response.data.data)) {
+          console.error('Invalid data structure: data.data is not an array. Full data:', JSON.stringify(response.data, null, 2));
+          message.reply('❌ [INVALID_RESPONSE] Unexpected API response structure. Please try again.');
+          return;
+        }
+
+        // Log full structure for debugging
+        console.log('Debugging - Full API response structure:', JSON.stringify(response.data, null, 2));
+
+        // Primary path: data.data[0].image_url
+        if (response.data.data?.[0]?.image_url) {
+          imageUrl = response.data.data[0].image_url;
+        }
+
+        // If primary not found, try fallback paths
+        if (!imageUrl) {
+          const FALLBACK_PATHS = [
+            ['url'],
+            ['image_url'],
+            ['images', 0, 'url'],
+            ['link'],
+            ['images', 'url'],
+            ['data', 'url'],
+            ['response', 'url'],
+            ['result', 'url'],
+            ['image', 'url']
+          ];
+
+          const isValidHttpUrl = (string) => {
+            if (typeof string !== 'string') return false;
+            try {
+              new URL(string);
+              return true;
+            } catch (err) {
+              return false;
+            }
+          };
+
+          const getNestedProperty = (obj, path) => path.reduce((acc, key) => acc?.[key], obj);
+
+          for (const path of FALLBACK_PATHS) {
+            const value = getNestedProperty(response.data, path);
+            if (value && isValidHttpUrl(value)) {
+              imageUrl = value;
+              console.debug(`Fallback path ${path.join('.')} successful. Image URL: ${imageUrl}`);
+              break;
+            } else {
+              console.debug(`Fallback path ${path.join('.')} attempted. Value: ${value}`);
+            }
+          }
+        }
+
+        // Validate and send image URL if found
+        if (imageUrl) {
+          if (isValidHttpUrl(imageUrl)) {
+            message.reply(`🖼️ Generated Image: ${imageUrl}`);
+          } else {
+            console.error('Invalid image URL format in API response after fallback:', imageUrl);
+            message.reply('❌ [URL_INVALID] Invalid image URL format in API response.');
+          }
+        } else {
+          console.error('No valid image URL found in API response after trying all fallback paths. Full data:', JSON.stringify(response.data, null, 2));
+          message.reply(`❌ [NO_IMAGE_URL] Could not find image URL in API response. Raw response: ${JSON.stringify(response.data)}`);
+        }
+      } else if (response?.data?.error || response?.data?.message) {
+        const errorDetail = response.data.error || response.data.message;
+        console.error('API returned error:', errorDetail);
+        message.reply(`❌ [API_ERROR] ${errorDetail}. Raw response: ${JSON.stringify(response.data)}`);
+      } else {
+        console.error('Unexpected API response structure. Full data:', response.data);
+        message.reply('❌ [UNEXPECTED_RESPONSE] Invalid response from image generation API. Raw response: ' + (response?.data ? JSON.stringify(response.data) : 'No data'));
+      }
+      return; // Successfully processed this model
+    }
 
 // Initialize bot
 const bot = new Client({
