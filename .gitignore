@@ -1,0 +1,41 @@
+# Node.js specific ignores
+node_modules/
+
+# Environment files
+.env
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local
+config.env
+
+# Build artifacts and distribution files
+dist/
+build/
+*.build/
+*.dist/
+*.tar.gz
+*.zip
+
+# IDE specific files
+.vscode/
+.idea/
+*.sublime-workspace
+*.sublime-project
+*.code-workspace
+
+# OS metadata files
+.DS_Store
+Thumbs.db
+
+# npm debug logs and other npm-related files
+npm-debug.log*
+npm-error.log*
+yarn-error.log*
+yarn-debug.log*
+
+# Test reports and coverage directories
+coverage/
+test-results/
+.jest.json
+.nyc_output/
